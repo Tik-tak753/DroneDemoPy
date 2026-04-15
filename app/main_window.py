@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -17,12 +17,16 @@ from PySide6.QtWidgets import (
 
 from app.services import YoloService, bgr_to_qpixmap
 from app.widgets import ImageView
+from app.workers import InferenceWorker
 
 # Simple first-step model config for still-image detection.
 YOLO_MODEL_PATH = r"C:\projects\DroneDemoPy\models\best.pt"
 
 
 class MainWindow(QMainWindow):
+    request_inference = Signal(object, str, int)
+    reset_worker_pending = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DroneDemoPy")
@@ -41,11 +45,25 @@ class MainWindow(QMainWindow):
         self._camera_detection_enabled = False
         self._camera_inference_failures = 0
 
+        self._stream_request_id = 0
+
         self._yolo_service = YoloService(YOLO_MODEL_PATH)
+        self._setup_inference_worker()
 
         self._create_central_widget()
         self._create_menu_bar()
         self.statusBar().showMessage("Ready")
+
+    def _setup_inference_worker(self) -> None:
+        self._inference_thread = QThread(self)
+        self._inference_worker = InferenceWorker(YOLO_MODEL_PATH)
+        self._inference_worker.moveToThread(self._inference_thread)
+
+        self.request_inference.connect(self._inference_worker.submit_frame)
+        self.reset_worker_pending.connect(self._inference_worker.reset_pending)
+        self._inference_worker.inference_ready.connect(self._handle_stream_inference_result)
+
+        self._inference_thread.start()
 
     def _create_central_widget(self) -> None:
         root = QWidget(self)
@@ -241,7 +259,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self._video_detection_enabled:
-            if not self._ensure_model_loaded():
+            if not self._stream_model_is_available():
                 self._video_detection_enabled = False
                 return
             self._video_detection_enabled = True
@@ -258,7 +276,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self._camera_detection_enabled:
-            if not self._ensure_model_loaded():
+            if not self._stream_model_is_available():
                 self._camera_detection_enabled = False
                 return
             self._camera_detection_enabled = True
@@ -270,6 +288,15 @@ class MainWindow(QMainWindow):
             self._set_status("Camera detection disabled")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: -")
+
+    def _stream_model_is_available(self) -> bool:
+        if self._yolo_service.model_file_exists():
+            return True
+
+        self._set_status(f"Model file not found: {YOLO_MODEL_PATH}")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: model not found")
+        return False
 
     def _ensure_model_loaded(self) -> bool:
         if not self._yolo_service.model_file_exists():
@@ -330,17 +357,45 @@ class MainWindow(QMainWindow):
             self._set_status("Playback finished")
             return
 
-        frame_to_show = frame_bgr
+        self._set_display_from_bgr(frame_bgr)
+
         if self._current_source_type == "video" and self._video_detection_enabled:
-            prediction = self._predict_single_frame(frame_bgr)
+            self.request_inference.emit(frame_bgr.copy(), "video", self._stream_request_id)
+        elif self._current_source_type == "camera" and self._camera_detection_enabled:
+            self.request_inference.emit(frame_bgr.copy(), "camera", self._stream_request_id)
+
+    def _handle_stream_inference_result(
+        self,
+        prediction,
+        status_message,
+        confidence_message,
+        source_type: str,
+        request_id: int,
+    ) -> None:
+        if request_id != self._stream_request_id:
+            return
+
+        if source_type == "video" and not self._video_detection_enabled:
+            return
+
+        if source_type == "camera" and not self._camera_detection_enabled:
+            return
+
+        if status_message is not None:
+            self._set_status(status_message)
+        if confidence_message is not None and self.confidence_label is not None:
+            self.confidence_label.setText(confidence_message)
+
+        if source_type == "video":
             if prediction is None:
                 self._video_detection_enabled = False
                 self._set_status("Inference failure: video detection disabled")
-            else:
-                frame_to_show = prediction.annotated_bgr
-                self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
-        elif self._current_source_type == "camera" and self._camera_detection_enabled:
-            prediction = self._predict_single_frame(frame_bgr)
+                return
+            self._set_display_from_bgr(prediction.annotated_bgr)
+            self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
+            return
+
+        if source_type == "camera":
             if prediction is None:
                 self._camera_inference_failures += 1
                 if self._camera_inference_failures >= 3:
@@ -349,15 +404,17 @@ class MainWindow(QMainWindow):
                     self._set_status("Inference failure: camera detection disabled")
                     if self.confidence_label is not None:
                         self.confidence_label.setText("Confidence: camera detection disabled")
-            else:
-                self._camera_inference_failures = 0
-                frame_to_show = prediction.annotated_bgr
-                self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
+                return
 
-        self._set_display_from_bgr(frame_to_show)
+            self._camera_inference_failures = 0
+            self._set_display_from_bgr(prediction.annotated_bgr)
+            self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
 
     def _release_video_resources(self) -> None:
         self._video_timer.stop()
+
+        self._stream_request_id += 1
+        self.reset_worker_pending.emit()
 
         if self._video_capture is not None:
             self._video_capture.release()
@@ -374,4 +431,6 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._release_video_resources()
+        self._inference_thread.quit()
+        self._inference_thread.wait(1000)
         super().closeEvent(event)
