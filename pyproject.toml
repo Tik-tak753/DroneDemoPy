@@ -7,6 +7,9 @@ files = [
     "app/__init__.py",
     "app/application.py",
     "app/main_window.py",
+    "app/services/__init__.py",
+    "app/services/yolo_service.py",
+    "app/services/frame_converter.py",
     "app/widgets/__init__.py",
     "app/widgets/image_view.py",
 ]
