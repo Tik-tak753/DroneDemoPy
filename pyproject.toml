@@ -2,4 +2,11 @@
 name = "PySide Project"
 
 [tool.pyside6-project]
-files = ["main.py", "app/__init__.py", "app/application.py", "app/main_window.py"]
+files = [
+    "main.py",
+    "app/__init__.py",
+    "app/application.py",
+    "app/main_window.py",
+    "app/widgets/__init__.py",
+    "app/widgets/image_view.py",
+]
