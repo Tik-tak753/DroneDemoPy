@@ -2,6 +2,8 @@ from pathlib import Path
 from time import perf_counter
 
 import cv2
+import mss
+import numpy as np
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
@@ -18,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.services import YoloService, bgr_to_qpixmap
-from app.widgets import ImageView
+from app.widgets import ImageView, ScreenRegionSelector
 from app.workers import InferenceWorker
 
 # Simple first-step model config for still-image detection.
@@ -50,8 +52,11 @@ class MainWindow(QMainWindow):
         self._current_image_bgr: cv2.typing.MatLike | None = None
         self._video_detection_enabled = False
         self._camera_detection_enabled = False
+        self._screen_detection_enabled = False
         self._video_paused = False
         self._camera_inference_failures = 0
+        self._screen_capture: mss.base.MSSBase | None = None
+        self._screen_region: dict[str, int] | None = None
 
         self._stream_session_id = 0
         self._stream_frame_id = 0
@@ -113,6 +118,10 @@ class MainWindow(QMainWindow):
         start_camera_button.clicked.connect(self._start_camera)
         panel_layout.addWidget(start_camera_button)
 
+        start_screen_capture_button = QPushButton("Start Screen Capture", panel)
+        start_screen_capture_button.clicked.connect(self._start_screen_capture)
+        panel_layout.addWidget(start_screen_capture_button)
+
         run_detection_button = QPushButton("Run Detection", panel)
         run_detection_button.clicked.connect(self._run_detection)
         panel_layout.addWidget(run_detection_button)
@@ -166,7 +175,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "About", "DroneDemoPy - PySide6 demo application")
 
     def _open_image(self) -> None:
-        self._release_video_resources()
+        self._release_stream_resources()
         self._reset_detection_state()
 
         file_path, _ = QFileDialog.getOpenFileName(
@@ -205,7 +214,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"Loaded image: {file_path}")
 
     def _open_video(self) -> None:
-        self._release_video_resources()
+        self._release_stream_resources()
         self._reset_detection_state()
 
         file_path, _ = QFileDialog.getOpenFileName(
@@ -238,11 +247,11 @@ class MainWindow(QMainWindow):
         self._set_fps_idle()
 
         self._set_status(f"Video loaded: {file_path}")
-        self._start_video_playback()
+        self._start_stream_playback()
 
     def _start_camera(self) -> None:
         # Simple behavior: always restart camera cleanly when button is pressed.
-        self._release_video_resources()
+        self._release_stream_resources()
         self._reset_detection_state()
 
         capture = cv2.VideoCapture(0)
@@ -264,7 +273,41 @@ class MainWindow(QMainWindow):
         self._set_fps_idle()
 
         self._set_status("Camera started")
-        self._start_video_playback()
+        self._start_stream_playback()
+
+    def _start_screen_capture(self) -> None:
+        self._release_stream_resources()
+        self._reset_detection_state()
+        self._set_status("Select a screen region (ESC to cancel)")
+
+        region = ScreenRegionSelector.select_region(self)
+        if region is None:
+            self._set_status("Screen region selection canceled")
+            return
+
+        try:
+            self._screen_capture = mss.mss()
+        except Exception as exc:
+            self._screen_capture = None
+            self._set_status(f"Screen capture start failed: {exc}")
+            return
+
+        self._screen_region = region
+        self._current_source_type = "screen"
+        self._current_image_bgr = None
+        self._video_paused = False
+
+        if self.source_label is not None:
+            self.source_label.setText("Source: screen")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
+        self._update_runtime_state_label()
+        self._set_fps_idle()
+
+        self._set_status(
+            f"Screen capture started: {region['width']}x{region['height']} at ({region['left']}, {region['top']})"
+        )
+        self._start_stream_playback()
 
     def _run_detection(self) -> None:
         if self._current_source_type == "image":
@@ -277,6 +320,10 @@ class MainWindow(QMainWindow):
 
         if self._current_source_type == "camera":
             self._toggle_camera_detection()
+            return
+
+        if self._current_source_type == "screen":
+            self._toggle_screen_detection()
             return
 
         self._set_status("No active source to run detection")
@@ -343,6 +390,25 @@ class MainWindow(QMainWindow):
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: -")
 
+    def _toggle_screen_detection(self) -> None:
+        if self._screen_capture is None or self._current_source_type != "screen":
+            self._set_status("Screen capture is not active")
+            return
+
+        if not self._screen_detection_enabled:
+            if not self._stream_model_is_available():
+                self._screen_detection_enabled = False
+                return
+            self._screen_detection_enabled = True
+            self._update_runtime_state_label()
+            self._set_status("Screen detection enabled")
+        else:
+            self._screen_detection_enabled = False
+            self._update_runtime_state_label()
+            self._set_status("Screen detection disabled")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: -")
+
     def _stream_model_is_available(self) -> bool:
         if self._yolo_service.model_file_exists():
             return True
@@ -391,13 +457,12 @@ class MainWindow(QMainWindow):
         self.image_view.set_pixmap(bgr_to_qpixmap(image_bgr))
         self._mark_frame_displayed()
 
-    def _start_video_playback(self) -> None:
-        if self._video_capture is None:
-            return
-
-        fps = self._video_capture.get(cv2.CAP_PROP_FPS)
-        if fps <= 0 or fps > 240:
-            fps = 30.0
+    def _start_stream_playback(self) -> None:
+        fps = 30.0
+        if self._video_capture is not None:
+            capture_fps = self._video_capture.get(cv2.CAP_PROP_FPS)
+            if 0 < capture_fps <= 240:
+                fps = capture_fps
 
         interval_ms = max(1, int(1000 / fps))
         self._video_interval_ms = interval_ms
@@ -430,13 +495,22 @@ class MainWindow(QMainWindow):
         self.pause_resume_button.setText("Resume" if self._video_paused else "Pause")
 
     def _read_next_video_frame(self) -> None:
-        if self._video_capture is None:
+        frame_bgr: cv2.typing.MatLike | None = None
+        if self._current_source_type in {"video", "camera"}:
+            if self._video_capture is None:
+                self._video_timer.stop()
+                return
+            success, captured_frame = self._video_capture.read()
+            if not success or captured_frame is None:
+                self._handle_stream_end_of_stream()
+                return
+            frame_bgr = captured_frame
+        elif self._current_source_type == "screen":
+            frame_bgr = self._read_next_screen_frame()
+            if frame_bgr is None:
+                return
+        else:
             self._video_timer.stop()
-            return
-
-        success, frame_bgr = self._video_capture.read()
-        if not success or frame_bgr is None:
-            self._handle_stream_end_of_stream()
             return
 
         source_type = self._current_source_type
@@ -444,6 +518,8 @@ class MainWindow(QMainWindow):
             source_type == "video" and self._video_detection_enabled
         ) or (
             source_type == "camera" and self._camera_detection_enabled
+        ) or (
+            source_type == "screen" and self._screen_detection_enabled
         )
 
         if stream_detection_enabled:
@@ -461,6 +537,26 @@ class MainWindow(QMainWindow):
             return
 
         self._set_display_from_bgr(frame_bgr)
+
+    def _read_next_screen_frame(self) -> cv2.typing.MatLike | None:
+        if self._screen_capture is None or self._screen_region is None:
+            self._video_timer.stop()
+            return None
+
+        try:
+            raw_frame = self._screen_capture.grab(self._screen_region)
+        except Exception as exc:
+            self._set_status(f"Screen capture failed: {exc}")
+            self._stop_active_stream()
+            return None
+
+        frame_bgra = np.asarray(raw_frame)
+        if frame_bgra.size == 0:
+            self._set_status("Screen capture failed: empty frame")
+            self._stop_active_stream()
+            return None
+
+        return cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
 
     def _handle_stream_inference_result(
         self,
@@ -483,6 +579,9 @@ class MainWindow(QMainWindow):
         if source_type == "camera" and not self._camera_detection_enabled:
             return
 
+        if source_type == "screen" and not self._screen_detection_enabled:
+            return
+
         if status_message is not None:
             self._set_status(status_message)
         if confidence_message is not None and self.confidence_label is not None:
@@ -494,6 +593,20 @@ class MainWindow(QMainWindow):
                 self._update_runtime_state_label()
                 self._set_status("Inference failure: video detection disabled")
                 return
+            self._set_display_from_bgr(prediction.annotated_bgr)
+            self._last_accepted_result_frame_id = frame_id
+            self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
+            return
+
+        if source_type == "screen":
+            if prediction is None:
+                self._screen_detection_enabled = False
+                self._update_runtime_state_label()
+                self._set_status("Inference failure: screen detection disabled")
+                if self.confidence_label is not None:
+                    self.confidence_label.setText("Confidence: screen detection disabled")
+                return
+
             self._set_display_from_bgr(prediction.annotated_bgr)
             self._last_accepted_result_frame_id = frame_id
             self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
@@ -527,6 +640,7 @@ class MainWindow(QMainWindow):
             self._video_detection_enabled = False
 
         self._camera_detection_enabled = False
+        self._screen_detection_enabled = False
         self._camera_inference_failures = 0
         self._update_runtime_state_label()
 
@@ -539,7 +653,7 @@ class MainWindow(QMainWindow):
         ):
             self._set_display_from_bgr(self._last_stream_frame_bgr)
 
-        self._release_video_resources(set_status=False)
+        self._release_stream_resources(set_status=False)
         self._current_source_type = "none"
         self._current_image_bgr = None
         self._update_runtime_state_label()
@@ -550,7 +664,7 @@ class MainWindow(QMainWindow):
             self.confidence_label.setText("Confidence: -")
         self._set_status("Playback finished")
 
-    def _release_video_resources(self, *, set_status: bool = True) -> None:
+    def _release_stream_resources(self, *, set_status: bool = True) -> None:
         self._video_timer.stop()
         self._video_paused = False
         self._update_pause_resume_button_label()
@@ -567,11 +681,19 @@ class MainWindow(QMainWindow):
             self._video_capture = None
             if set_status:
                 self._set_status("Camera/video stopped")
+
+        if self._screen_capture is not None:
+            self._screen_capture.close()
+            self._screen_capture = None
+            self._screen_region = None
+            if set_status:
+                self._set_status("Screen capture stopped")
         self._set_fps_idle()
 
     def _reset_detection_state(self) -> None:
         self._video_detection_enabled = False
         self._camera_detection_enabled = False
+        self._screen_detection_enabled = False
         self._camera_inference_failures = 0
         self._stream_frame_id = 0
         self._last_accepted_result_frame_id = -1
@@ -583,12 +705,14 @@ class MainWindow(QMainWindow):
         return float(self.confidence_spinbox.value())
 
     def _stop_active_stream(self) -> None:
-        if self._current_source_type not in {"video", "camera"} or self._video_capture is None:
+        has_video_stream = self._current_source_type in {"video", "camera"} and self._video_capture is not None
+        has_screen_stream = self._current_source_type == "screen" and self._screen_capture is not None
+        if not has_video_stream and not has_screen_stream:
             self._set_status("No active stream to stop")
             return
 
         stopped_source = self._current_source_type
-        self._release_video_resources()
+        self._release_stream_resources()
         self._reset_detection_state()
         self._current_source_type = "none"
         self._current_image_bgr = None
@@ -611,6 +735,8 @@ class MainWindow(QMainWindow):
             detection_enabled = self._video_detection_enabled
         elif self._current_source_type == "camera":
             detection_enabled = self._camera_detection_enabled
+        elif self._current_source_type == "screen":
+            detection_enabled = self._screen_detection_enabled
 
         detection_text = "ON" if detection_enabled else "OFF"
         self.mode_state_label.setText(
@@ -642,7 +768,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._release_video_resources()
+        self._release_stream_resources()
         self._inference_thread.quit()
         self._inference_thread.wait(1000)
         super().closeEvent(event)

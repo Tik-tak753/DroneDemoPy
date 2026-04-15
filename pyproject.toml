@@ -12,4 +12,5 @@ files = [
     "app/services/frame_converter.py",
     "app/widgets/__init__.py",
     "app/widgets/image_view.py",
+    "app/widgets/screen_region_selector.py",
 ]
