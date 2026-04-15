@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.services import YoloService, bgr_to_qpixmap
-from app.widgets import ImageView, ScreenRegionSelector
+from app.widgets import ImageView, OverlayDetection, ScreenOverlayWidget, ScreenRegionSelector
 from app.workers import InferenceWorker
 
 # Simple first-step model config for still-image detection.
@@ -57,6 +57,8 @@ class MainWindow(QMainWindow):
         self._camera_inference_failures = 0
         self._screen_capture: mss.base.MSSBase | None = None
         self._screen_region: dict[str, int] | None = None
+        self._screen_overlay: ScreenOverlayWidget | None = None
+        self._saved_non_screen_window_size = self.size()
 
         self._stream_session_id = 0
         self._stream_frame_id = 0
@@ -307,6 +309,8 @@ class MainWindow(QMainWindow):
         self._set_status(
             f"Screen capture started: {region['width']}x{region['height']} at ({region['left']}, {region['top']})"
         )
+        self._set_screen_control_panel_mode(True)
+        self._sync_screen_overlay_region()
         self._start_stream_playback()
 
     def _run_detection(self) -> None:
@@ -400,10 +404,15 @@ class MainWindow(QMainWindow):
                 self._screen_detection_enabled = False
                 return
             self._screen_detection_enabled = True
+            self._sync_screen_overlay_region()
+            if self._screen_overlay is not None:
+                self._screen_overlay.clear_detections()
+                self._screen_overlay.show()
             self._update_runtime_state_label()
             self._set_status("Screen detection enabled")
         else:
             self._screen_detection_enabled = False
+            self._hide_screen_overlay()
             self._update_runtime_state_label()
             self._set_status("Screen detection disabled")
             if self.confidence_label is not None:
@@ -537,6 +546,8 @@ class MainWindow(QMainWindow):
             return
 
         self._set_display_from_bgr(frame_bgr)
+        if source_type == "screen":
+            self._hide_screen_overlay()
 
     def _read_next_screen_frame(self) -> cv2.typing.MatLike | None:
         if self._screen_capture is None or self._screen_region is None:
@@ -601,6 +612,7 @@ class MainWindow(QMainWindow):
         if source_type == "screen":
             if prediction is None:
                 self._screen_detection_enabled = False
+                self._hide_screen_overlay()
                 self._update_runtime_state_label()
                 self._set_status("Inference failure: screen detection disabled")
                 if self.confidence_label is not None:
@@ -608,6 +620,7 @@ class MainWindow(QMainWindow):
                 return
 
             self._set_display_from_bgr(prediction.annotated_bgr)
+            self._show_screen_overlay_with_prediction(prediction)
             self._last_accepted_result_frame_id = frame_id
             self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
             return
@@ -642,6 +655,7 @@ class MainWindow(QMainWindow):
         self._camera_detection_enabled = False
         self._screen_detection_enabled = False
         self._camera_inference_failures = 0
+        self._hide_screen_overlay()
         self._update_runtime_state_label()
 
         # Keep no-flicker playback behavior, but avoid ending on a stale annotated frame
@@ -688,6 +702,8 @@ class MainWindow(QMainWindow):
             self._screen_region = None
             if set_status:
                 self._set_status("Screen capture stopped")
+        self._hide_screen_overlay()
+        self._set_screen_control_panel_mode(False)
         self._set_fps_idle()
 
     def _reset_detection_state(self) -> None:
@@ -725,6 +741,56 @@ class MainWindow(QMainWindow):
 
         # Keep the last rendered frame on screen after stop for demo friendliness.
         self._set_status(f"{stopped_source.capitalize()} stopped (last frame kept)")
+
+    def _set_screen_control_panel_mode(self, enabled: bool) -> None:
+        if enabled:
+            self._saved_non_screen_window_size = self.size()
+            self.image_view.hide()
+            compact_width = 300
+            compact_height = max(self.height(), 600)
+            self.resize(compact_width, compact_height)
+            return
+
+        self.image_view.show()
+        if self._saved_non_screen_window_size.isValid():
+            self.resize(self._saved_non_screen_window_size)
+
+    def _ensure_screen_overlay(self) -> ScreenOverlayWidget:
+        if self._screen_overlay is None:
+            self._screen_overlay = ScreenOverlayWidget()
+        return self._screen_overlay
+
+    def _sync_screen_overlay_region(self) -> None:
+        if self._screen_region is None:
+            return
+        overlay = self._ensure_screen_overlay()
+        overlay.set_region_geometry(self._screen_region)
+
+    def _show_screen_overlay_with_prediction(self, prediction) -> None:
+        if self._screen_region is None:
+            return
+
+        overlay = self._ensure_screen_overlay()
+        overlay.set_region_geometry(self._screen_region)
+        detections = [
+            OverlayDetection(
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+                label=label,
+                confidence=confidence,
+            )
+            for x1, y1, x2, y2, label, confidence in prediction.detections
+        ]
+        overlay.set_detections(detections)
+        overlay.show()
+
+    def _hide_screen_overlay(self) -> None:
+        if self._screen_overlay is None:
+            return
+        self._screen_overlay.clear_detections()
+        self._screen_overlay.hide()
 
     def _update_runtime_state_label(self) -> None:
         if self.mode_state_label is None:
@@ -769,6 +835,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self._release_stream_resources()
+        if self._screen_overlay is not None:
+            self._screen_overlay.close()
+            self._screen_overlay = None
         self._inference_thread.quit()
         self._inference_thread.wait(1000)
         super().closeEvent(event)
