@@ -1,5 +1,9 @@
+from pathlib import Path
+
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QFrame,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -17,6 +21,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DroneDemoPy")
         self.resize(1000, 700)
+
+        self.source_label: QLabel | None = None
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -45,7 +51,7 @@ class MainWindow(QMainWindow):
         panel_layout.setSpacing(8)
 
         open_image_button = QPushButton("Open Image", panel)
-        open_image_button.clicked.connect(lambda: self._set_status("Open Image clicked"))
+        open_image_button.clicked.connect(self._open_image)
         panel_layout.addWidget(open_image_button)
 
         open_video_button = QPushButton("Open Video", panel)
@@ -65,8 +71,8 @@ class MainWindow(QMainWindow):
         confidence_label = QLabel("Confidence: -", panel)
         panel_layout.addWidget(confidence_label)
 
-        source_label = QLabel("Source: none", panel)
-        panel_layout.addWidget(source_label)
+        self.source_label = QLabel("Source: none", panel)
+        panel_layout.addWidget(self.source_label)
 
         panel_layout.addStretch()
         panel.setMaximumWidth(260)
@@ -83,6 +89,28 @@ class MainWindow(QMainWindow):
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About", "DroneDemoPy - PySide6 demo application")
+
+    def _open_image(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp)",
+        )
+
+        if not file_path:
+            self._set_status("Image open canceled")
+            return
+
+        pixmap = QPixmap(file_path)
+        if pixmap.isNull():
+            self._set_status("Failed to load image")
+            return
+
+        self.image_view.set_pixmap(pixmap)
+        if self.source_label is not None:
+            self.source_label.setText(f"Source: {Path(file_path).name}")
+        self._set_status(f"Loaded image: {file_path}")
 
     def _set_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
