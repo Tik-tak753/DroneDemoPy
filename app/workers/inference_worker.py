@@ -9,7 +9,7 @@ from app.services import YoloService
 
 
 class InferenceWorker(QObject):
-    inference_ready = Signal(object, object, object, str, int)
+    inference_ready = Signal(object, object, object, str, int, int)
 
     def __init__(self, model_path: str) -> None:
         super().__init__()
@@ -17,15 +17,23 @@ class InferenceWorker(QObject):
         self._lock = threading.Lock()
         self._pending_frame: cv2.typing.MatLike | None = None
         self._pending_source_type = "none"
-        self._pending_request_id = 0
+        self._pending_session_id = 0
+        self._pending_frame_id = -1
         self._processing = False
 
-    @Slot(object, str, int)
-    def submit_frame(self, frame_bgr: cv2.typing.MatLike, source_type: str, request_id: int) -> None:
+    @Slot(object, str, int, int)
+    def submit_frame(
+        self,
+        frame_bgr: cv2.typing.MatLike,
+        source_type: str,
+        session_id: int,
+        frame_id: int,
+    ) -> None:
         with self._lock:
             self._pending_frame = frame_bgr
             self._pending_source_type = source_type
-            self._pending_request_id = request_id
+            self._pending_session_id = session_id
+            self._pending_frame_id = frame_id
             if self._processing:
                 return
             self._processing = True
@@ -34,7 +42,8 @@ class InferenceWorker(QObject):
             with self._lock:
                 frame = self._pending_frame
                 source = self._pending_source_type
-                current_request_id = self._pending_request_id
+                current_session_id = self._pending_session_id
+                current_frame_id = self._pending_frame_id
                 self._pending_frame = None
 
             if frame is None:
@@ -50,7 +59,8 @@ class InferenceWorker(QObject):
                         status_message,
                         confidence_message,
                         source,
-                        current_request_id,
+                        current_session_id,
+                        current_frame_id,
                     )
                     continue
 
@@ -60,10 +70,12 @@ class InferenceWorker(QObject):
                 status_message,
                 confidence_message,
                 source,
-                current_request_id,
+                current_session_id,
+                current_frame_id,
             )
 
     @Slot()
     def reset_pending(self) -> None:
         with self._lock:
             self._pending_frame = None
+            self._pending_frame_id = -1
