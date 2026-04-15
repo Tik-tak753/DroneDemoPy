@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self._current_source_type = "none"
         self._current_image_bgr: cv2.typing.MatLike | None = None
         self._model: YOLO | None = None
+        self._video_detection_enabled = False
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -107,6 +108,7 @@ class MainWindow(QMainWindow):
 
     def _open_image(self) -> None:
         self._release_video_resources()
+        self._video_detection_enabled = False
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -142,6 +144,7 @@ class MainWindow(QMainWindow):
 
     def _open_video(self) -> None:
         self._release_video_resources()
+        self._video_detection_enabled = False
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -175,6 +178,7 @@ class MainWindow(QMainWindow):
     def _start_camera(self) -> None:
         # Simple behavior: always restart camera cleanly when button is pressed.
         self._release_video_resources()
+        self._video_detection_enabled = False
 
         capture = cv2.VideoCapture(0)
         if not capture.isOpened():
@@ -195,60 +199,117 @@ class MainWindow(QMainWindow):
         self._start_video_playback()
 
     def _run_detection(self) -> None:
-        if self._current_source_type != "image" or self._current_image_bgr is None:
-            self._set_status("Detection is currently supported only for loaded images")
+        if self._current_source_type == "image":
+            self._run_image_detection()
             return
 
+        if self._current_source_type == "video":
+            self._toggle_video_detection()
+            return
+
+        if self._current_source_type == "camera":
+            self._set_status("Camera detection is not enabled yet")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: camera detection disabled")
+            return
+
+        self._set_status("No active source to run detection")
+
+    def _run_image_detection(self) -> None:
+        if self._current_image_bgr is None:
+            self._set_status("No image is loaded")
+            return
+
+        if not self._ensure_model_loaded():
+            return
+
+        self._set_status("Running inference on image...")
+        result = self._predict_single_frame(self._current_image_bgr)
+        if result is None:
+            return
+
+        annotated_bgr, detection_count, top_confidence = result
+        self._set_display_from_bgr(annotated_bgr)
+        self._update_confidence_label(detection_count, top_confidence)
+        self._set_status(
+            f"Detection complete: {detection_count} detection(s), top confidence {top_confidence:.3f}"
+        )
+
+    def _toggle_video_detection(self) -> None:
+        if self._video_capture is None:
+            self._set_status("No video is loaded")
+            return
+
+        if not self._video_detection_enabled:
+            if not self._ensure_model_loaded():
+                self._video_detection_enabled = False
+                return
+            self._video_detection_enabled = True
+            self._set_status("Video detection enabled")
+        else:
+            self._video_detection_enabled = False
+            self._set_status("Video detection disabled")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: -")
+
+    def _ensure_model_loaded(self) -> bool:
         model_file = Path(YOLO_MODEL_PATH)
         if not model_file.exists():
             self._set_status(f"Model file not found: {YOLO_MODEL_PATH}")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: model not found")
-            return
+            return False
 
-        if self._model is None:
-            self._set_status(f"Loading model: {YOLO_MODEL_PATH}")
-            try:
-                self._model = YOLO(str(model_file))
-            except Exception as exc:
-                self._set_status(f"Model load failed: {exc}")
-                if self.confidence_label is not None:
-                    self.confidence_label.setText("Confidence: model load failed")
-                return
+        if self._model is not None:
+            return True
 
-        self._set_status("Running inference on image...")
+        self._set_status(f"Loading model: {YOLO_MODEL_PATH}")
         try:
-            results = self._model.predict(self._current_image_bgr, verbose=False)
+            self._model = YOLO(str(model_file))
+        except Exception as exc:
+            self._set_status(f"Model load failed: {exc}")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: model load failed")
+            return False
+
+        return True
+
+    def _predict_single_frame(
+        self, frame_bgr: cv2.typing.MatLike
+    ) -> tuple[cv2.typing.MatLike, int, float] | None:
+        if self._model is None:
+            self._set_status("Inference failed: model not loaded")
+            return None
+
+        try:
+            results = self._model.predict(frame_bgr, verbose=False)
         except Exception as exc:
             self._set_status(f"Inference failed: {exc}")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: inference failed")
-            return
+            return None
 
         if not results:
             self._set_status("Inference completed: no result returned")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: no result")
-            return
+            return None
 
         result = results[0]
         annotated_bgr = result.plot()
-        self._set_display_from_bgr(annotated_bgr)
-
         boxes = result.boxes
         detection_count = int(len(boxes)) if boxes is not None else 0
         top_confidence = 0.0
         if boxes is not None and boxes.conf is not None and len(boxes.conf) > 0:
             top_confidence = float(boxes.conf.max().item())
 
+        return annotated_bgr, detection_count, top_confidence
+
+    def _update_confidence_label(self, detection_count: int, top_confidence: float) -> None:
         if self.confidence_label is not None:
             self.confidence_label.setText(
                 f"Confidence: top={top_confidence:.3f}, detections={detection_count}"
             )
-
-        self._set_status(
-            f"Detection complete: {detection_count} detection(s), top confidence {top_confidence:.3f}"
-        )
 
     def _set_display_from_bgr(self, image_bgr: cv2.typing.MatLike) -> None:
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -287,18 +348,18 @@ class MainWindow(QMainWindow):
             self._set_status("Playback finished")
             return
 
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        height, width, channels = frame_rgb.shape
-        bytes_per_line = channels * width
-        image = QImage(
-            frame_rgb.data,
-            width,
-            height,
-            bytes_per_line,
-            QImage.Format_RGB888,
-        ).copy()
+        frame_to_show = frame_bgr
+        if self._current_source_type == "video" and self._video_detection_enabled:
+            prediction = self._predict_single_frame(frame_bgr)
+            if prediction is None:
+                self._video_detection_enabled = False
+                self._set_status("Inference failure: video detection disabled")
+            else:
+                annotated_bgr, detection_count, top_confidence = prediction
+                frame_to_show = annotated_bgr
+                self._update_confidence_label(detection_count, top_confidence)
 
-        self.image_view.set_pixmap(QPixmap.fromImage(image))
+        self._set_display_from_bgr(frame_to_show)
 
     def _release_video_resources(self) -> None:
         self._video_timer.stop()
