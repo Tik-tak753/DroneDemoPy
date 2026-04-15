@@ -19,21 +19,24 @@ class InferenceWorker(QObject):
         self._pending_source_type = "none"
         self._pending_session_id = 0
         self._pending_frame_id = -1
+        self._pending_conf_threshold = 0.25
         self._processing = False
 
-    @Slot(object, str, int, int)
+    @Slot(object, str, int, int, float)
     def submit_frame(
         self,
         frame_bgr: cv2.typing.MatLike,
         source_type: str,
         session_id: int,
         frame_id: int,
+        conf_threshold: float,
     ) -> None:
         with self._lock:
             self._pending_frame = frame_bgr
             self._pending_source_type = source_type
             self._pending_session_id = session_id
             self._pending_frame_id = frame_id
+            self._pending_conf_threshold = conf_threshold
             if self._processing:
                 return
             self._processing = True
@@ -44,6 +47,7 @@ class InferenceWorker(QObject):
                 source = self._pending_source_type
                 current_session_id = self._pending_session_id
                 current_frame_id = self._pending_frame_id
+                current_conf_threshold = self._pending_conf_threshold
                 self._pending_frame = None
 
             if frame is None:
@@ -64,7 +68,10 @@ class InferenceWorker(QObject):
                     )
                     continue
 
-            prediction, status_message, confidence_message = self._service.predict_single_frame(frame)
+            prediction, status_message, confidence_message = self._service.predict_single_frame(
+                frame,
+                conf_threshold=current_conf_threshold,
+            )
             self.inference_ready.emit(
                 prediction,
                 status_message,

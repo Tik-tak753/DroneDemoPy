@@ -1,10 +1,12 @@
 from pathlib import Path
+from time import perf_counter
 
 import cv2
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -24,7 +26,7 @@ YOLO_MODEL_PATH = r"C:\projects\DroneDemoPy\models\best.pt"
 
 
 class MainWindow(QMainWindow):
-    request_inference = Signal(object, str, int, int)
+    request_inference = Signal(object, str, int, int, float)
     reset_worker_pending = Signal()
 
     def __init__(self) -> None:
@@ -34,6 +36,9 @@ class MainWindow(QMainWindow):
 
         self.source_label: QLabel | None = None
         self.confidence_label: QLabel | None = None
+        self.mode_state_label: QLabel | None = None
+        self.fps_label: QLabel | None = None
+        self.confidence_spinbox: QDoubleSpinBox | None = None
 
         self._video_capture: cv2.VideoCapture | None = None
         self._video_timer = QTimer(self)
@@ -48,6 +53,8 @@ class MainWindow(QMainWindow):
         self._stream_session_id = 0
         self._stream_frame_id = 0
         self._last_accepted_result_frame_id = -1
+        self._displayed_frames = 0
+        self._fps_window_start = perf_counter()
 
         self._yolo_service = YoloService(YOLO_MODEL_PATH)
         self._setup_inference_worker()
@@ -105,13 +112,33 @@ class MainWindow(QMainWindow):
         run_detection_button.clicked.connect(self._run_detection)
         panel_layout.addWidget(run_detection_button)
 
+        stop_button = QPushButton("Stop", panel)
+        stop_button.clicked.connect(self._stop_active_stream)
+        panel_layout.addWidget(stop_button)
+
         panel_layout.addSpacing(16)
+
+        confidence_threshold_label = QLabel("Confidence Threshold:", panel)
+        panel_layout.addWidget(confidence_threshold_label)
+
+        self.confidence_spinbox = QDoubleSpinBox(panel)
+        self.confidence_spinbox.setRange(0.05, 0.95)
+        self.confidence_spinbox.setSingleStep(0.05)
+        self.confidence_spinbox.setDecimals(2)
+        self.confidence_spinbox.setValue(0.25)
+        panel_layout.addWidget(self.confidence_spinbox)
 
         self.confidence_label = QLabel("Confidence: -", panel)
         panel_layout.addWidget(self.confidence_label)
 
         self.source_label = QLabel("Source: none", panel)
         panel_layout.addWidget(self.source_label)
+
+        self.mode_state_label = QLabel("Mode: none | Detection: OFF", panel)
+        panel_layout.addWidget(self.mode_state_label)
+
+        self.fps_label = QLabel("FPS: -", panel)
+        panel_layout.addWidget(self.fps_label)
 
         panel_layout.addStretch()
         panel.setMaximumWidth(260)
@@ -158,10 +185,13 @@ class MainWindow(QMainWindow):
         self._current_image_bgr = image_bgr
 
         self.image_view.set_pixmap(pixmap)
+        self._mark_frame_displayed()
         if self.source_label is not None:
             self.source_label.setText(f"Source: {Path(file_path).name} (image)")
         if self.confidence_label is not None:
             self.confidence_label.setText("Confidence: -")
+        self._update_runtime_state_label()
+        self._set_fps_idle()
 
         self._set_status(f"Loaded image: {file_path}")
 
@@ -194,6 +224,8 @@ class MainWindow(QMainWindow):
             self.source_label.setText(f"Source: {Path(file_path).name} (video)")
         if self.confidence_label is not None:
             self.confidence_label.setText("Confidence: -")
+        self._update_runtime_state_label()
+        self._set_fps_idle()
 
         self._set_status(f"Video loaded: {file_path}")
         self._start_video_playback()
@@ -217,6 +249,8 @@ class MainWindow(QMainWindow):
             self.source_label.setText("Source: camera 0")
         if self.confidence_label is not None:
             self.confidence_label.setText("Confidence: -")
+        self._update_runtime_state_label()
+        self._set_fps_idle()
 
         self._set_status("Camera started")
         self._start_video_playback()
@@ -245,7 +279,10 @@ class MainWindow(QMainWindow):
             return
 
         self._set_status("Running inference on image...")
-        prediction = self._predict_single_frame(self._current_image_bgr)
+        prediction = self._predict_single_frame(
+            self._current_image_bgr,
+            conf_threshold=self._current_confidence_threshold(),
+        )
         if prediction is None:
             return
 
@@ -265,9 +302,11 @@ class MainWindow(QMainWindow):
                 self._video_detection_enabled = False
                 return
             self._video_detection_enabled = True
+            self._update_runtime_state_label()
             self._set_status("Video detection enabled")
         else:
             self._video_detection_enabled = False
+            self._update_runtime_state_label()
             self._set_status("Video detection disabled")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: -")
@@ -283,10 +322,12 @@ class MainWindow(QMainWindow):
                 return
             self._camera_detection_enabled = True
             self._camera_inference_failures = 0
+            self._update_runtime_state_label()
             self._set_status("Camera detection enabled")
         else:
             self._camera_detection_enabled = False
             self._camera_inference_failures = 0
+            self._update_runtime_state_label()
             self._set_status("Camera detection disabled")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: -")
@@ -318,8 +359,11 @@ class MainWindow(QMainWindow):
             self.confidence_label.setText(confidence_message)
         return loaded
 
-    def _predict_single_frame(self, frame_bgr: cv2.typing.MatLike):
-        prediction, status_message, confidence_message = self._yolo_service.predict_single_frame(frame_bgr)
+    def _predict_single_frame(self, frame_bgr: cv2.typing.MatLike, conf_threshold: float):
+        prediction, status_message, confidence_message = self._yolo_service.predict_single_frame(
+            frame_bgr,
+            conf_threshold=conf_threshold,
+        )
         if status_message is not None:
             self._set_status(status_message)
         if confidence_message is not None and self.confidence_label is not None:
@@ -334,6 +378,7 @@ class MainWindow(QMainWindow):
 
     def _set_display_from_bgr(self, image_bgr: cv2.typing.MatLike) -> None:
         self.image_view.set_pixmap(bgr_to_qpixmap(image_bgr))
+        self._mark_frame_displayed()
 
     def _start_video_playback(self) -> None:
         if self._video_capture is None:
@@ -344,6 +389,7 @@ class MainWindow(QMainWindow):
             fps = 30.0
 
         interval_ms = max(1, int(1000 / fps))
+        self._reset_fps_counter()
         self._video_timer.start(interval_ms)
         self._set_status("Playback started")
 
@@ -374,6 +420,7 @@ class MainWindow(QMainWindow):
                 source_type,
                 self._stream_session_id,
                 frame_id,
+                self._current_confidence_threshold(),
             )
             return
 
@@ -408,6 +455,7 @@ class MainWindow(QMainWindow):
         if source_type == "video":
             if prediction is None:
                 self._video_detection_enabled = False
+                self._update_runtime_state_label()
                 self._set_status("Inference failure: video detection disabled")
                 return
             self._set_display_from_bgr(prediction.annotated_bgr)
@@ -421,6 +469,7 @@ class MainWindow(QMainWindow):
                 if self._camera_inference_failures >= 3:
                     self._camera_detection_enabled = False
                     self._camera_inference_failures = 0
+                    self._update_runtime_state_label()
                     self._set_status("Inference failure: camera detection disabled")
                     if self.confidence_label is not None:
                         self.confidence_label.setText("Confidence: camera detection disabled")
@@ -443,6 +492,7 @@ class MainWindow(QMainWindow):
             self._video_capture.release()
             self._video_capture = None
             self._set_status("Camera/video stopped")
+        self._set_fps_idle()
 
     def _reset_detection_state(self) -> None:
         self._video_detection_enabled = False
@@ -450,6 +500,68 @@ class MainWindow(QMainWindow):
         self._camera_inference_failures = 0
         self._stream_frame_id = 0
         self._last_accepted_result_frame_id = -1
+        self._update_runtime_state_label()
+
+    def _current_confidence_threshold(self) -> float:
+        if self.confidence_spinbox is None:
+            return 0.25
+        return float(self.confidence_spinbox.value())
+
+    def _stop_active_stream(self) -> None:
+        if self._current_source_type not in {"video", "camera"} or self._video_capture is None:
+            self._set_status("No active stream to stop")
+            return
+
+        stopped_source = self._current_source_type
+        self._release_video_resources()
+        self._reset_detection_state()
+        self._current_source_type = "none"
+        self._current_image_bgr = None
+        self._update_runtime_state_label()
+
+        if self.source_label is not None:
+            self.source_label.setText("Source: none")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
+
+        # Keep the last rendered frame on screen after stop for demo friendliness.
+        self._set_status(f"{stopped_source.capitalize()} stopped (last frame kept)")
+
+    def _update_runtime_state_label(self) -> None:
+        if self.mode_state_label is None:
+            return
+
+        detection_enabled = False
+        if self._current_source_type == "video":
+            detection_enabled = self._video_detection_enabled
+        elif self._current_source_type == "camera":
+            detection_enabled = self._camera_detection_enabled
+
+        detection_text = "ON" if detection_enabled else "OFF"
+        self.mode_state_label.setText(
+            f"Mode: {self._current_source_type} | Detection: {detection_text}"
+        )
+
+    def _reset_fps_counter(self) -> None:
+        self._displayed_frames = 0
+        self._fps_window_start = perf_counter()
+        self._set_fps_idle()
+
+    def _mark_frame_displayed(self) -> None:
+        self._displayed_frames += 1
+        elapsed = perf_counter() - self._fps_window_start
+        if elapsed < 0.5:
+            return
+
+        fps = self._displayed_frames / elapsed
+        if self.fps_label is not None:
+            self.fps_label.setText(f"FPS: {fps:.1f}")
+        self._displayed_frames = 0
+        self._fps_window_start = perf_counter()
+
+    def _set_fps_idle(self) -> None:
+        if self.fps_label is not None:
+            self.fps_label.setText("FPS: -")
 
     def _set_status(self, message: str) -> None:
         self.statusBar().showMessage(message)

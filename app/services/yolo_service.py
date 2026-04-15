@@ -31,13 +31,13 @@ class YoloService:
         return True, None, None
 
     def predict_single_frame(
-        self, frame_bgr: cv2.typing.MatLike
+        self, frame_bgr: cv2.typing.MatLike, conf_threshold: float = 0.25
     ) -> tuple[PredictionResult | None, str | None, str | None]:
         if self._model is None:
             return None, "Inference failed: model not loaded", None
 
         try:
-            results = self._model.predict(frame_bgr, verbose=False)
+            results = self._model.predict(frame_bgr, verbose=False, conf=conf_threshold)
         except Exception as exc:
             return None, f"Inference failed: {exc}", "Confidence: inference failed"
 
