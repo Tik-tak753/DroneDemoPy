@@ -53,6 +53,8 @@ class MainWindow(QMainWindow):
         self._stream_session_id = 0
         self._stream_frame_id = 0
         self._last_accepted_result_frame_id = -1
+        self._last_stream_frame_bgr: cv2.typing.MatLike | None = None
+        self._last_stream_frame_id = -1
         self._displayed_frames = 0
         self._fps_window_start = perf_counter()
 
@@ -400,9 +402,7 @@ class MainWindow(QMainWindow):
 
         success, frame_bgr = self._video_capture.read()
         if not success or frame_bgr is None:
-            self._video_timer.stop()
-            self._release_video_resources()
-            self._set_status("Playback finished")
+            self._handle_stream_end_of_stream()
             return
 
         source_type = self._current_source_type
@@ -415,6 +415,8 @@ class MainWindow(QMainWindow):
         if stream_detection_enabled:
             frame_id = self._stream_frame_id
             self._stream_frame_id += 1
+            self._last_stream_frame_bgr = frame_bgr.copy()
+            self._last_stream_frame_id = frame_id
             self.request_inference.emit(
                 frame_bgr.copy(),
                 source_type,
@@ -480,18 +482,55 @@ class MainWindow(QMainWindow):
             self._last_accepted_result_frame_id = frame_id
             self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
 
-    def _release_video_resources(self) -> None:
+    def _handle_stream_end_of_stream(self) -> None:
+        if self._video_capture is None:
+            self._video_timer.stop()
+            return
+
+        is_video_source = self._current_source_type == "video"
+        video_detection_was_enabled = is_video_source and self._video_detection_enabled
+        if video_detection_was_enabled:
+            self._video_detection_enabled = False
+
+        self._camera_detection_enabled = False
+        self._camera_inference_failures = 0
+        self._update_runtime_state_label()
+
+        # Keep no-flicker playback behavior, but avoid ending on a stale annotated frame
+        # by showing the final decoded frame once when inference is lagging behind.
+        if (
+            is_video_source
+            and self._last_stream_frame_bgr is not None
+            and self._last_stream_frame_id > self._last_accepted_result_frame_id
+        ):
+            self._set_display_from_bgr(self._last_stream_frame_bgr)
+
+        self._release_video_resources(set_status=False)
+        self._current_source_type = "none"
+        self._current_image_bgr = None
+        self._update_runtime_state_label()
+
+        if self.source_label is not None:
+            self.source_label.setText("Source: none")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
+        self._set_status("Playback finished")
+
+    def _release_video_resources(self, *, set_status: bool = True) -> None:
         self._video_timer.stop()
 
         self._stream_session_id += 1
         self._stream_frame_id = 0
         self._last_accepted_result_frame_id = -1
+        self._last_stream_frame_bgr = None
+        self._last_stream_frame_id = -1
         self.reset_worker_pending.emit()
 
         if self._video_capture is not None:
             self._video_capture.release()
             self._video_capture = None
-            self._set_status("Camera/video stopped")
+            if set_status:
+                self._set_status("Camera/video stopped")
         self._set_fps_idle()
 
     def _reset_detection_state(self) -> None:
