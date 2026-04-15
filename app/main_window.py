@@ -39,6 +39,8 @@ class MainWindow(QMainWindow):
         self._current_image_bgr: cv2.typing.MatLike | None = None
         self._model: YOLO | None = None
         self._video_detection_enabled = False
+        self._camera_detection_enabled = False
+        self._camera_inference_failures = 0
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -108,7 +110,7 @@ class MainWindow(QMainWindow):
 
     def _open_image(self) -> None:
         self._release_video_resources()
-        self._video_detection_enabled = False
+        self._reset_detection_state()
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -144,7 +146,7 @@ class MainWindow(QMainWindow):
 
     def _open_video(self) -> None:
         self._release_video_resources()
-        self._video_detection_enabled = False
+        self._reset_detection_state()
 
         file_path, _ = QFileDialog.getOpenFileName(
             self,
@@ -178,7 +180,7 @@ class MainWindow(QMainWindow):
     def _start_camera(self) -> None:
         # Simple behavior: always restart camera cleanly when button is pressed.
         self._release_video_resources()
-        self._video_detection_enabled = False
+        self._reset_detection_state()
 
         capture = cv2.VideoCapture(0)
         if not capture.isOpened():
@@ -208,9 +210,7 @@ class MainWindow(QMainWindow):
             return
 
         if self._current_source_type == "camera":
-            self._set_status("Camera detection is not enabled yet")
-            if self.confidence_label is not None:
-                self.confidence_label.setText("Confidence: camera detection disabled")
+            self._toggle_camera_detection()
             return
 
         self._set_status("No active source to run detection")
@@ -249,6 +249,25 @@ class MainWindow(QMainWindow):
         else:
             self._video_detection_enabled = False
             self._set_status("Video detection disabled")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: -")
+
+    def _toggle_camera_detection(self) -> None:
+        if self._video_capture is None or self._current_source_type != "camera":
+            self._set_status("Camera is not active")
+            return
+
+        if not self._camera_detection_enabled:
+            if not self._ensure_model_loaded():
+                self._camera_detection_enabled = False
+                return
+            self._camera_detection_enabled = True
+            self._camera_inference_failures = 0
+            self._set_status("Camera detection enabled")
+        else:
+            self._camera_detection_enabled = False
+            self._camera_inference_failures = 0
+            self._set_status("Camera detection disabled")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: -")
 
@@ -358,6 +377,21 @@ class MainWindow(QMainWindow):
                 annotated_bgr, detection_count, top_confidence = prediction
                 frame_to_show = annotated_bgr
                 self._update_confidence_label(detection_count, top_confidence)
+        elif self._current_source_type == "camera" and self._camera_detection_enabled:
+            prediction = self._predict_single_frame(frame_bgr)
+            if prediction is None:
+                self._camera_inference_failures += 1
+                if self._camera_inference_failures >= 3:
+                    self._camera_detection_enabled = False
+                    self._camera_inference_failures = 0
+                    self._set_status("Inference failure: camera detection disabled")
+                    if self.confidence_label is not None:
+                        self.confidence_label.setText("Confidence: camera detection disabled")
+            else:
+                self._camera_inference_failures = 0
+                annotated_bgr, detection_count, top_confidence = prediction
+                frame_to_show = annotated_bgr
+                self._update_confidence_label(detection_count, top_confidence)
 
         self._set_display_from_bgr(frame_to_show)
 
@@ -368,6 +402,11 @@ class MainWindow(QMainWindow):
             self._video_capture.release()
             self._video_capture = None
             self._set_status("Camera/video stopped")
+
+    def _reset_detection_state(self) -> None:
+        self._video_detection_enabled = False
+        self._camera_detection_enabled = False
+        self._camera_inference_failures = 0
 
     def _set_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
