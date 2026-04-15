@@ -2,7 +2,7 @@ from pathlib import Path
 
 import cv2
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QCloseEvent, QImage, QPixmap
+from PySide6.QtGui import QCloseEvent, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QFileDialog,
@@ -14,8 +14,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from ultralytics import YOLO
 
+from app.services import YoloService, bgr_to_qpixmap
 from app.widgets import ImageView
 
 # Simple first-step model config for still-image detection.
@@ -37,10 +37,11 @@ class MainWindow(QMainWindow):
 
         self._current_source_type = "none"
         self._current_image_bgr: cv2.typing.MatLike | None = None
-        self._model: YOLO | None = None
         self._video_detection_enabled = False
         self._camera_detection_enabled = False
         self._camera_inference_failures = 0
+
+        self._yolo_service = YoloService(YOLO_MODEL_PATH)
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -224,15 +225,14 @@ class MainWindow(QMainWindow):
             return
 
         self._set_status("Running inference on image...")
-        result = self._predict_single_frame(self._current_image_bgr)
-        if result is None:
+        prediction = self._predict_single_frame(self._current_image_bgr)
+        if prediction is None:
             return
 
-        annotated_bgr, detection_count, top_confidence = result
-        self._set_display_from_bgr(annotated_bgr)
-        self._update_confidence_label(detection_count, top_confidence)
+        self._set_display_from_bgr(prediction.annotated_bgr)
+        self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
         self._set_status(
-            f"Detection complete: {detection_count} detection(s), top confidence {top_confidence:.3f}"
+            f"Detection complete: {prediction.detection_count} detection(s), top confidence {prediction.top_confidence:.3f}"
         )
 
     def _toggle_video_detection(self) -> None:
@@ -272,57 +272,30 @@ class MainWindow(QMainWindow):
                 self.confidence_label.setText("Confidence: -")
 
     def _ensure_model_loaded(self) -> bool:
-        model_file = Path(YOLO_MODEL_PATH)
-        if not model_file.exists():
+        if not self._yolo_service.model_file_exists():
             self._set_status(f"Model file not found: {YOLO_MODEL_PATH}")
             if self.confidence_label is not None:
                 self.confidence_label.setText("Confidence: model not found")
             return False
 
-        if self._model is not None:
+        if self._yolo_service.has_loaded_model():
             return True
 
         self._set_status(f"Loading model: {YOLO_MODEL_PATH}")
-        try:
-            self._model = YOLO(str(model_file))
-        except Exception as exc:
-            self._set_status(f"Model load failed: {exc}")
-            if self.confidence_label is not None:
-                self.confidence_label.setText("Confidence: model load failed")
-            return False
+        loaded, status_message, confidence_message = self._yolo_service.load_model()
+        if status_message is not None:
+            self._set_status(status_message)
+        if confidence_message is not None and self.confidence_label is not None:
+            self.confidence_label.setText(confidence_message)
+        return loaded
 
-        return True
-
-    def _predict_single_frame(
-        self, frame_bgr: cv2.typing.MatLike
-    ) -> tuple[cv2.typing.MatLike, int, float] | None:
-        if self._model is None:
-            self._set_status("Inference failed: model not loaded")
-            return None
-
-        try:
-            results = self._model.predict(frame_bgr, verbose=False)
-        except Exception as exc:
-            self._set_status(f"Inference failed: {exc}")
-            if self.confidence_label is not None:
-                self.confidence_label.setText("Confidence: inference failed")
-            return None
-
-        if not results:
-            self._set_status("Inference completed: no result returned")
-            if self.confidence_label is not None:
-                self.confidence_label.setText("Confidence: no result")
-            return None
-
-        result = results[0]
-        annotated_bgr = result.plot()
-        boxes = result.boxes
-        detection_count = int(len(boxes)) if boxes is not None else 0
-        top_confidence = 0.0
-        if boxes is not None and boxes.conf is not None and len(boxes.conf) > 0:
-            top_confidence = float(boxes.conf.max().item())
-
-        return annotated_bgr, detection_count, top_confidence
+    def _predict_single_frame(self, frame_bgr: cv2.typing.MatLike):
+        prediction, status_message, confidence_message = self._yolo_service.predict_single_frame(frame_bgr)
+        if status_message is not None:
+            self._set_status(status_message)
+        if confidence_message is not None and self.confidence_label is not None:
+            self.confidence_label.setText(confidence_message)
+        return prediction
 
     def _update_confidence_label(self, detection_count: int, top_confidence: float) -> None:
         if self.confidence_label is not None:
@@ -331,17 +304,7 @@ class MainWindow(QMainWindow):
             )
 
     def _set_display_from_bgr(self, image_bgr: cv2.typing.MatLike) -> None:
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        height, width, channels = image_rgb.shape
-        bytes_per_line = channels * width
-        image = QImage(
-            image_rgb.data,
-            width,
-            height,
-            bytes_per_line,
-            QImage.Format_RGB888,
-        ).copy()
-        self.image_view.set_pixmap(QPixmap.fromImage(image))
+        self.image_view.set_pixmap(bgr_to_qpixmap(image_bgr))
 
     def _start_video_playback(self) -> None:
         if self._video_capture is None:
@@ -374,9 +337,8 @@ class MainWindow(QMainWindow):
                 self._video_detection_enabled = False
                 self._set_status("Inference failure: video detection disabled")
             else:
-                annotated_bgr, detection_count, top_confidence = prediction
-                frame_to_show = annotated_bgr
-                self._update_confidence_label(detection_count, top_confidence)
+                frame_to_show = prediction.annotated_bgr
+                self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
         elif self._current_source_type == "camera" and self._camera_detection_enabled:
             prediction = self._predict_single_frame(frame_bgr)
             if prediction is None:
@@ -389,9 +351,8 @@ class MainWindow(QMainWindow):
                         self.confidence_label.setText("Confidence: camera detection disabled")
             else:
                 self._camera_inference_failures = 0
-                annotated_bgr, detection_count, top_confidence = prediction
-                frame_to_show = annotated_bgr
-                self._update_confidence_label(detection_count, top_confidence)
+                frame_to_show = prediction.annotated_bgr
+                self._update_confidence_label(prediction.detection_count, prediction.top_confidence)
 
         self._set_display_from_bgr(frame_to_show)
 
