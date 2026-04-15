@@ -39,15 +39,18 @@ class MainWindow(QMainWindow):
         self.mode_state_label: QLabel | None = None
         self.fps_label: QLabel | None = None
         self.confidence_spinbox: QDoubleSpinBox | None = None
+        self.pause_resume_button: QPushButton | None = None
 
         self._video_capture: cv2.VideoCapture | None = None
         self._video_timer = QTimer(self)
         self._video_timer.timeout.connect(self._read_next_video_frame)
+        self._video_interval_ms = 33
 
         self._current_source_type = "none"
         self._current_image_bgr: cv2.typing.MatLike | None = None
         self._video_detection_enabled = False
         self._camera_detection_enabled = False
+        self._video_paused = False
         self._camera_inference_failures = 0
 
         self._stream_session_id = 0
@@ -117,6 +120,10 @@ class MainWindow(QMainWindow):
         stop_button = QPushButton("Stop", panel)
         stop_button.clicked.connect(self._stop_active_stream)
         panel_layout.addWidget(stop_button)
+
+        self.pause_resume_button = QPushButton("Pause", panel)
+        self.pause_resume_button.clicked.connect(self._toggle_video_pause_resume)
+        panel_layout.addWidget(self.pause_resume_button)
 
         panel_layout.addSpacing(16)
 
@@ -220,6 +227,7 @@ class MainWindow(QMainWindow):
 
         self._current_source_type = "video"
         self._current_image_bgr = None
+        self._video_paused = False
 
         self._video_capture = capture
         if self.source_label is not None:
@@ -245,6 +253,7 @@ class MainWindow(QMainWindow):
 
         self._current_source_type = "camera"
         self._current_image_bgr = None
+        self._video_paused = False
 
         self._video_capture = capture
         if self.source_label is not None:
@@ -391,9 +400,34 @@ class MainWindow(QMainWindow):
             fps = 30.0
 
         interval_ms = max(1, int(1000 / fps))
+        self._video_interval_ms = interval_ms
+        self._video_paused = False
+        self._update_pause_resume_button_label()
         self._reset_fps_counter()
         self._video_timer.start(interval_ms)
         self._set_status("Playback started")
+
+    def _toggle_video_pause_resume(self) -> None:
+        if self._current_source_type != "video" or self._video_capture is None:
+            self._set_status("Pause/Resume is only available for active video playback")
+            return
+
+        if not self._video_paused:
+            self._video_timer.stop()
+            self._video_paused = True
+            self._update_pause_resume_button_label()
+            self._set_status("Video paused")
+            return
+
+        self._video_paused = False
+        self._update_pause_resume_button_label()
+        self._video_timer.start(self._video_interval_ms)
+        self._set_status("Video resumed")
+
+    def _update_pause_resume_button_label(self) -> None:
+        if self.pause_resume_button is None:
+            return
+        self.pause_resume_button.setText("Resume" if self._video_paused else "Pause")
 
     def _read_next_video_frame(self) -> None:
         if self._video_capture is None:
@@ -518,6 +552,8 @@ class MainWindow(QMainWindow):
 
     def _release_video_resources(self, *, set_status: bool = True) -> None:
         self._video_timer.stop()
+        self._video_paused = False
+        self._update_pause_resume_button_label()
 
         self._stream_session_id += 1
         self._stream_frame_id = 0
