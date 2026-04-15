@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from PySide6.QtGui import QPixmap
+import cv2
+from PySide6.QtCore import QTimer
+from PySide6.QtGui import QCloseEvent, QImage, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QFileDialog,
@@ -23,6 +25,9 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
 
         self.source_label: QLabel | None = None
+        self._video_capture: cv2.VideoCapture | None = None
+        self._video_timer = QTimer(self)
+        self._video_timer.timeout.connect(self._read_next_video_frame)
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -55,7 +60,7 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(open_image_button)
 
         open_video_button = QPushButton("Open Video", panel)
-        open_video_button.clicked.connect(lambda: self._set_status("Open Video clicked"))
+        open_video_button.clicked.connect(self._open_video)
         panel_layout.addWidget(open_video_button)
 
         start_camera_button = QPushButton("Start Camera", panel)
@@ -91,6 +96,8 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "About", "DroneDemoPy - PySide6 demo application")
 
     def _open_image(self) -> None:
+        self._release_video_resources()
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Open Image",
@@ -112,5 +119,80 @@ class MainWindow(QMainWindow):
             self.source_label.setText(f"Source: {Path(file_path).name}")
         self._set_status(f"Loaded image: {file_path}")
 
+    def _open_video(self) -> None:
+        self._release_video_resources()
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Video",
+            "",
+            "Videos (*.mp4 *.avi *.mov *.mkv);;All Files (*)",
+        )
+
+        if not file_path:
+            self._set_status("Video open canceled")
+            return
+
+        capture = cv2.VideoCapture(file_path)
+        if not capture.isOpened():
+            capture.release()
+            self._set_status("Failed to load video")
+            return
+
+        self._video_capture = capture
+        if self.source_label is not None:
+            self.source_label.setText(f"Source: {Path(file_path).name}")
+
+        self._set_status(f"Video loaded: {file_path}")
+        self._start_video_playback()
+
+    def _start_video_playback(self) -> None:
+        if self._video_capture is None:
+            return
+
+        fps = self._video_capture.get(cv2.CAP_PROP_FPS)
+        if fps <= 0 or fps > 240:
+            fps = 30.0
+
+        interval_ms = max(1, int(1000 / fps))
+        self._video_timer.start(interval_ms)
+        self._set_status("Playback started")
+
+    def _read_next_video_frame(self) -> None:
+        if self._video_capture is None:
+            self._video_timer.stop()
+            return
+
+        success, frame_bgr = self._video_capture.read()
+        if not success or frame_bgr is None:
+            self._video_timer.stop()
+            self._release_video_resources()
+            self._set_status("Playback finished")
+            return
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        height, width, channels = frame_rgb.shape
+        bytes_per_line = channels * width
+        image = QImage(
+            frame_rgb.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format_RGB888,
+        ).copy()
+
+        self.image_view.set_pixmap(QPixmap.fromImage(image))
+
+    def _release_video_resources(self) -> None:
+        self._video_timer.stop()
+
+        if self._video_capture is not None:
+            self._video_capture.release()
+            self._video_capture = None
+
     def _set_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._release_video_resources()
+        super().closeEvent(event)
