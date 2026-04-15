@@ -1,11 +1,7 @@
 import sys
-from PySide6.QtWidgets import QApplication, QWidget
 
-app = QApplication(sys.argv)
+from app.application import run
 
-window = QWidget()
-window.resize(800, 600)
-window.setWindowTitle("DroneDemoPy")
-window.show()
 
-sys.exit(app.exec())
+if __name__ == "__main__":
+    sys.exit(run())
