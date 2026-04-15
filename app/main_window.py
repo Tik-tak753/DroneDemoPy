@@ -64,7 +64,7 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(open_video_button)
 
         start_camera_button = QPushButton("Start Camera", panel)
-        start_camera_button.clicked.connect(lambda: self._set_status("Start Camera clicked"))
+        start_camera_button.clicked.connect(self._start_camera)
         panel_layout.addWidget(start_camera_button)
 
         run_detection_button = QPushButton("Run Detection", panel)
@@ -146,6 +146,23 @@ class MainWindow(QMainWindow):
         self._set_status(f"Video loaded: {file_path}")
         self._start_video_playback()
 
+    def _start_camera(self) -> None:
+        # Simple behavior: always restart camera cleanly when button is pressed.
+        self._release_video_resources()
+
+        capture = cv2.VideoCapture(0)
+        if not capture.isOpened():
+            capture.release()
+            self._set_status("Camera failed to open")
+            return
+
+        self._video_capture = capture
+        if self.source_label is not None:
+            self.source_label.setText("Source: camera 0")
+
+        self._set_status("Camera started")
+        self._start_video_playback()
+
     def _start_video_playback(self) -> None:
         if self._video_capture is None:
             return
@@ -189,6 +206,7 @@ class MainWindow(QMainWindow):
         if self._video_capture is not None:
             self._video_capture.release()
             self._video_capture = None
+            self._set_status("Camera/video stopped")
 
     def _set_status(self, message: str) -> None:
         self.statusBar().showMessage(message)
