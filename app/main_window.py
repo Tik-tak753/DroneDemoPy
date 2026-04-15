@@ -14,8 +14,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ultralytics import YOLO
 
 from app.widgets import ImageView
+
+# Simple first-step model config for still-image detection.
+YOLO_MODEL_PATH = r"C:\projects\DroneDemoPy\models\best.pt"
 
 
 class MainWindow(QMainWindow):
@@ -25,9 +29,15 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
 
         self.source_label: QLabel | None = None
+        self.confidence_label: QLabel | None = None
+
         self._video_capture: cv2.VideoCapture | None = None
         self._video_timer = QTimer(self)
         self._video_timer.timeout.connect(self._read_next_video_frame)
+
+        self._current_source_type = "none"
+        self._current_image_bgr: cv2.typing.MatLike | None = None
+        self._model: YOLO | None = None
 
         self._create_central_widget()
         self._create_menu_bar()
@@ -68,13 +78,13 @@ class MainWindow(QMainWindow):
         panel_layout.addWidget(start_camera_button)
 
         run_detection_button = QPushButton("Run Detection", panel)
-        run_detection_button.clicked.connect(lambda: self._set_status("Run Detection clicked"))
+        run_detection_button.clicked.connect(self._run_detection)
         panel_layout.addWidget(run_detection_button)
 
         panel_layout.addSpacing(16)
 
-        confidence_label = QLabel("Confidence: -", panel)
-        panel_layout.addWidget(confidence_label)
+        self.confidence_label = QLabel("Confidence: -", panel)
+        panel_layout.addWidget(self.confidence_label)
 
         self.source_label = QLabel("Source: none", panel)
         panel_layout.addWidget(self.source_label)
@@ -109,14 +119,25 @@ class MainWindow(QMainWindow):
             self._set_status("Image open canceled")
             return
 
-        pixmap = QPixmap(file_path)
-        if pixmap.isNull():
+        image_bgr = cv2.imread(file_path)
+        if image_bgr is None:
             self._set_status("Failed to load image")
             return
 
+        pixmap = QPixmap(file_path)
+        if pixmap.isNull():
+            self._set_status("Failed to display image")
+            return
+
+        self._current_source_type = "image"
+        self._current_image_bgr = image_bgr
+
         self.image_view.set_pixmap(pixmap)
         if self.source_label is not None:
-            self.source_label.setText(f"Source: {Path(file_path).name}")
+            self.source_label.setText(f"Source: {Path(file_path).name} (image)")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
+
         self._set_status(f"Loaded image: {file_path}")
 
     def _open_video(self) -> None:
@@ -139,9 +160,14 @@ class MainWindow(QMainWindow):
             self._set_status("Failed to load video")
             return
 
+        self._current_source_type = "video"
+        self._current_image_bgr = None
+
         self._video_capture = capture
         if self.source_label is not None:
-            self.source_label.setText(f"Source: {Path(file_path).name}")
+            self.source_label.setText(f"Source: {Path(file_path).name} (video)")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
 
         self._set_status(f"Video loaded: {file_path}")
         self._start_video_playback()
@@ -156,12 +182,86 @@ class MainWindow(QMainWindow):
             self._set_status("Camera failed to open")
             return
 
+        self._current_source_type = "camera"
+        self._current_image_bgr = None
+
         self._video_capture = capture
         if self.source_label is not None:
             self.source_label.setText("Source: camera 0")
+        if self.confidence_label is not None:
+            self.confidence_label.setText("Confidence: -")
 
         self._set_status("Camera started")
         self._start_video_playback()
+
+    def _run_detection(self) -> None:
+        if self._current_source_type != "image" or self._current_image_bgr is None:
+            self._set_status("Detection is currently supported only for loaded images")
+            return
+
+        model_file = Path(YOLO_MODEL_PATH)
+        if not model_file.exists():
+            self._set_status(f"Model file not found: {YOLO_MODEL_PATH}")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: model not found")
+            return
+
+        if self._model is None:
+            self._set_status(f"Loading model: {YOLO_MODEL_PATH}")
+            try:
+                self._model = YOLO(str(model_file))
+            except Exception as exc:
+                self._set_status(f"Model load failed: {exc}")
+                if self.confidence_label is not None:
+                    self.confidence_label.setText("Confidence: model load failed")
+                return
+
+        self._set_status("Running inference on image...")
+        try:
+            results = self._model.predict(self._current_image_bgr, verbose=False)
+        except Exception as exc:
+            self._set_status(f"Inference failed: {exc}")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: inference failed")
+            return
+
+        if not results:
+            self._set_status("Inference completed: no result returned")
+            if self.confidence_label is not None:
+                self.confidence_label.setText("Confidence: no result")
+            return
+
+        result = results[0]
+        annotated_bgr = result.plot()
+        self._set_display_from_bgr(annotated_bgr)
+
+        boxes = result.boxes
+        detection_count = int(len(boxes)) if boxes is not None else 0
+        top_confidence = 0.0
+        if boxes is not None and boxes.conf is not None and len(boxes.conf) > 0:
+            top_confidence = float(boxes.conf.max().item())
+
+        if self.confidence_label is not None:
+            self.confidence_label.setText(
+                f"Confidence: top={top_confidence:.3f}, detections={detection_count}"
+            )
+
+        self._set_status(
+            f"Detection complete: {detection_count} detection(s), top confidence {top_confidence:.3f}"
+        )
+
+    def _set_display_from_bgr(self, image_bgr: cv2.typing.MatLike) -> None:
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        height, width, channels = image_rgb.shape
+        bytes_per_line = channels * width
+        image = QImage(
+            image_rgb.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format_RGB888,
+        ).copy()
+        self.image_view.set_pixmap(QPixmap.fromImage(image))
 
     def _start_video_playback(self) -> None:
         if self._video_capture is None:
